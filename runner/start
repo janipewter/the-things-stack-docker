@@ -219,7 +219,8 @@ elif [ -n "${CF_API_TOKEN}" ] && [ -n "${TTS_ACME_EMAIL}" ]; then
 
     echo -e "${COLOR_INFO}ACME certificate available after $(( $(date +%s) - ACME_START_TS )) seconds${COLOR_END}"
 
-    # We have consumed whatever the certbot service published
+    # Whatever certbot published is the certificate we are about to load, so
+    # the pending-reload marker no longer applies.
     rm -f "${DATA_FOLDER}/acme_reload"
 
 else
@@ -344,17 +345,34 @@ fi
 # -----------------------------------------------------------------------------
 
 # The stack reads its certificate once at startup, so a renewal only takes
-# effect after a restart. Watch for the marker the certbot service writes and
-# stop the stack when it appears; the restart policy brings it back up.
+# effect after a restart. Compare the certificate we are about to serve with
+# the one on disk and restart when they diverge. We compare content rather
+# than waiting for a marker file, because a marker written while the stack is
+# down, or before it finished booting, would be missed.
 if [ -n "${CF_API_TOKEN}" ] && [ -n "${TTS_ACME_EMAIL}" ]; then
+
+    LOADED_CERT=$(openssl x509 -in "${DATA_FOLDER}/cert.pem" -noout -fingerprint -sha256 2>/dev/null)
+
     (
-        while [ ! -f "${DATA_FOLDER}/acme_reload" ]; do
+        while true; do
+
             sleep 60
+
+            CURRENT_CERT=$(openssl x509 -in "${DATA_FOLDER}/cert.pem" -noout -fingerprint -sha256 2>/dev/null)
+
+            # Ignore a transient read failure while certbot rewrites the file
+            [ -z "${CURRENT_CERT}" ] && continue
+
+            if [ "${CURRENT_CERT}" != "${LOADED_CERT}" ]; then
+                echo -e "${COLOR_INFO}Certificate on disk changed, restarting to load it.${COLOR_END}"
+                rm -f "${DATA_FOLDER}/acme_reload"
+                kill -TERM 1 2>/dev/null
+                break
+            fi
+
         done
-        echo -e "${COLOR_INFO}Certificate renewed, restarting to load it.${COLOR_END}"
-        rm -f "${DATA_FOLDER}/acme_reload"
-        kill -TERM 1 2>/dev/null
     ) &
+
 fi
 
 ttn-lw-stack -c "${STACK_CONFIG_FILE}" start
