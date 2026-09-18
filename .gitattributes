@@ -1,0 +1,5 @@
+# Scripts run inside Linux containers and must keep LF endings, otherwise the
+# shebang line breaks with a "not found" error at runtime.
+runner/* text eol=lf
+Dockerfile* text eol=lf
+*.sh text eol=lf

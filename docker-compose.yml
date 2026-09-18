@@ -1,10 +1,11 @@
 version: '2'
 
 volumes:
-  redis: 
+  redis:
   postgres:
   stack-blob:
   stack-data:
+  letsencrypt:
 
 services:
 
@@ -31,6 +32,26 @@ services:
     ports:
       - "127.0.0.1:6379:6379"
   
+  certbot:
+    build:
+      context: .
+      dockerfile: Dockerfile.certbot
+    container_name: certbot
+    restart: unless-stopped
+    volumes:
+      - 'stack-data:/srv/data'
+      - 'letsencrypt:/etc/letsencrypt'
+    environment:
+      # Left empty so a balena fleet/device variable of the same name is used.
+      # A value set here would take precedence over it.
+      TTS_DOMAIN: ''
+      # Set CF_API_TOKEN and TTS_ACME_EMAIL to enable publicly-trusted
+      # certificates. Without them the stack falls back to self-signed ones.
+      CF_API_TOKEN: ''
+      TTS_ACME_EMAIL: ''
+      # Set to "true" while testing to avoid the Let's Encrypt rate limits
+      TTS_ACME_STAGING: 'false'
+
   stack:
     image: xoseperez/the-things-stack:latest
     #build:
@@ -44,11 +65,18 @@ services:
     depends_on:
       - redis
       - postgres
+      - certbot
     volumes:
       - 'stack-blob:/srv/ttn-lorawan/public/blob'
       - 'stack-data:/srv/data'
     environment:
-      TTS_DOMAIN: lns.example.com
+      # Left empty so a balena fleet/device variable of the same name is used.
+      # A value set here would take precedence over it. On balena, an unset
+      # TTS_DOMAIN falls back to the device LAN IP, which works for
+      # self-signed certificates but not for ACME.
+      TTS_DOMAIN: ''
+      CF_API_TOKEN: ''
+      TTS_ACME_EMAIL: ''
       TTN_LW_BLOB_LOCAL_DIRECTORY: /srv/ttn-lorawan/public/blob
       TTN_LW_REDIS_ADDRESS: redis:6379
       TTN_LW_IS_DATABASE_URI: postgres://root:root@postgres:5432/ttn_lorawan?sslmode=disable

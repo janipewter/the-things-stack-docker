@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.0 (2026-09-18)
+
+* Automatic publicly-trusted certificates from Let's Encrypt using the Cloudflare DNS-01 challenge, enabled by setting `CF_API_TOKEN` and `TTS_ACME_EMAIL`
+* **Breaking**: `TTS_DOMAIN` no longer defaults to `lns.example.com` in `docker-compose.yml`, so that a balena fleet or device variable of the same name takes effect. Deployments relying on the previous default must now set `TTS_DOMAIN` explicitly
+
 ## 1.3.1 (2025-10-28)
 
 * Updated to Stack 3.34.3

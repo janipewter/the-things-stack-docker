@@ -1,0 +1,162 @@
+#!/bin/sh
+
+# -----------------------------------------------------------------------------
+# Obtains and renews a publicly-trusted certificate from Let's Encrypt using
+# the Cloudflare DNS-01 challenge, and publishes it where the stack expects it.
+#
+# DNS-01 is used rather than HTTP-01 because the device needs no inbound
+# connectivity: it only makes outbound calls to Cloudflare and Let's Encrypt.
+# -----------------------------------------------------------------------------
+
+COLOR_INFO="\e[32m" # green
+COLOR_ERROR="\e[31m" # red
+COLOR_END="\e[0m"
+
+DATA_FOLDER=/srv/data
+CLOUDFLARE_INI=/tmp/cloudflare.ini
+RENEWAL_INTERVAL=${TTS_ACME_RENEWAL_INTERVAL:-43200} # 12 hours
+
+# The stack runs as uid/gid 886 and must be able to read the key
+STACK_UID=886
+STACK_GID=886
+
+# -----------------------------------------------------------------------------
+# Check required settings
+# -----------------------------------------------------------------------------
+
+if [ -z "${TTS_DOMAIN}" ]; then
+    echo -e "${COLOR_ERROR}ERROR: TTS_DOMAIN not defined. Set it as a balena fleet or device variable.${COLOR_END}"
+    sleep infinity
+    exit 1
+fi
+
+# Let's Encrypt does not issue for IP addresses, and the stack falls back to
+# the LAN IP when TTS_DOMAIN is unset. Fail loudly rather than repeatedly
+# failing validation and consuming the rate limit.
+if echo "${TTS_DOMAIN}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    echo -e "${COLOR_ERROR}ERROR: TTS_DOMAIN is an IP address (${TTS_DOMAIN}). ACME requires a public DNS name.${COLOR_END}"
+    sleep infinity
+    exit 1
+fi
+
+if ! echo "${TTS_DOMAIN}" | grep -qE '^[A-Za-z0-9._-]+\.[A-Za-z]{2,}$'; then
+    echo -e "${COLOR_ERROR}ERROR: TTS_DOMAIN (${TTS_DOMAIN}) is not a fully qualified domain name.${COLOR_END}"
+    sleep infinity
+    exit 1
+fi
+
+if [ -z "${CF_API_TOKEN}" ]; then
+    echo -e "${COLOR_ERROR}ERROR: CF_API_TOKEN not defined.${COLOR_END}"
+    sleep infinity
+    exit 1
+fi
+
+if [ -z "${TTS_ACME_EMAIL}" ]; then
+    echo -e "${COLOR_ERROR}ERROR: TTS_ACME_EMAIL not defined.${COLOR_END}"
+    sleep infinity
+    exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# Cloudflare credentials
+# -----------------------------------------------------------------------------
+
+# certbot refuses to use a credentials file that is group/world readable
+umask 077
+echo "dns_cloudflare_api_token = ${CF_API_TOKEN}" > "${CLOUDFLARE_INI}"
+chmod 600 "${CLOUDFLARE_INI}"
+
+# -----------------------------------------------------------------------------
+# Staging
+# -----------------------------------------------------------------------------
+
+# Let's Encrypt rate limits are strict (5 failures/hour, 50 certs/week per
+# domain), so allow testing against the staging environment first.
+STAGING_FLAG=""
+# Matched case-insensitively and accepting "1"/"yes": a typo here would
+# silently fall through to production and consume the real rate limit.
+if echo "${TTS_ACME_STAGING}" | grep -qiE '^(true|1|yes)$'; then
+    echo -e "${COLOR_INFO}Using the Let's Encrypt STAGING environment, certificates will NOT be trusted.${COLOR_END}"
+    STAGING_FLAG="--staging"
+fi
+
+# -----------------------------------------------------------------------------
+# Publish certificate to the data folder
+# -----------------------------------------------------------------------------
+
+publish_certificate() {
+
+    LIVE_FOLDER="/etc/letsencrypt/live/${TTS_DOMAIN}"
+
+    if [ ! -f "${LIVE_FOLDER}/fullchain.pem" ]; then
+        echo -e "${COLOR_ERROR}ERROR: no certificate found in ${LIVE_FOLDER}.${COLOR_END}"
+        return 1
+    fi
+
+    # Only republish when the certificate actually changed, so we do not
+    # restart the stack on every polling cycle.
+    NEW_SIGNATURE=$(openssl x509 -in "${LIVE_FOLDER}/fullchain.pem" -noout -fingerprint -sha256 2>/dev/null)
+    CURRENT_SIGNATURE=$(cat "${DATA_FOLDER}/acme_signature" 2>/dev/null)
+
+    if [ "${NEW_SIGNATURE}" = "${CURRENT_SIGNATURE}" ]; then
+        echo -e "${COLOR_INFO}Certificate unchanged, nothing to publish.${COLOR_END}"
+        return 0
+    fi
+
+    # The stack reads cert.pem/key.pem, and publishes ca.pem to gateways as
+    # TC_TRUST. chain.pem is the issuer chain without the leaf, which is what
+    # a BasicStation gateway needs to verify this server.
+    cp "${LIVE_FOLDER}/fullchain.pem" "${DATA_FOLDER}/cert.pem"
+    cp "${LIVE_FOLDER}/privkey.pem" "${DATA_FOLDER}/key.pem"
+    cp "${LIVE_FOLDER}/chain.pem" "${DATA_FOLDER}/ca.pem"
+
+    chown ${STACK_UID}:${STACK_GID} "${DATA_FOLDER}/cert.pem" "${DATA_FOLDER}/key.pem" "${DATA_FOLDER}/ca.pem"
+    chmod 644 "${DATA_FOLDER}/cert.pem" "${DATA_FOLDER}/ca.pem"
+    chmod 640 "${DATA_FOLDER}/key.pem"
+
+    echo "${NEW_SIGNATURE}" > "${DATA_FOLDER}/acme_signature"
+
+    # Tell the stack a new certificate is available. The stack clears this
+    # marker once it has restarted and picked the certificate up.
+    date +%s > "${DATA_FOLDER}/acme_reload"
+    chown ${STACK_UID}:${STACK_GID} "${DATA_FOLDER}/acme_reload"
+
+    echo -e "${COLOR_INFO}Published new certificate for ${TTS_DOMAIN}.${COLOR_END}"
+    return 0
+
+}
+
+# -----------------------------------------------------------------------------
+# Main loop
+# -----------------------------------------------------------------------------
+
+echo -e "${COLOR_INFO}------------------------------------------------------------------${COLOR_END}"
+echo -e "${COLOR_INFO}ACME certificate manager (Cloudflare DNS-01)${COLOR_END}"
+echo -e "${COLOR_INFO}Domain:      ${TTS_DOMAIN}${COLOR_END}"
+echo -e "${COLOR_INFO}Email:       ${TTS_ACME_EMAIL}${COLOR_END}"
+echo -e "${COLOR_INFO}------------------------------------------------------------------${COLOR_END}"
+
+while true; do
+
+    # certonly is idempotent: it issues on the first run and is a no-op later
+    # until the certificate is within 30 days of expiry.
+    certbot certonly \
+        --non-interactive \
+        --agree-tos \
+        --keep-until-expiring \
+        --dns-cloudflare \
+        --dns-cloudflare-credentials "${CLOUDFLARE_INI}" \
+        --dns-cloudflare-propagation-seconds "${TTS_ACME_PROPAGATION_SECONDS:-30}" \
+        --email "${TTS_ACME_EMAIL}" \
+        --domain "${TTS_DOMAIN}" \
+        ${STAGING_FLAG}
+
+    if [ $? -eq 0 ]; then
+        publish_certificate
+    else
+        echo -e "${COLOR_ERROR}ERROR: certbot failed, retrying in ${RENEWAL_INTERVAL} seconds.${COLOR_END}"
+    fi
+
+    sleep "${RENEWAL_INTERVAL}"
+
+done

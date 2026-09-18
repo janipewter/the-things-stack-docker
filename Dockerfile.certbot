@@ -1,0 +1,10 @@
+FROM certbot/dns-cloudflare:latest
+
+LABEL org.label-schema.name="ACME certificate manager for The Things Stack"
+LABEL org.label-schema.description="Obtains Let's Encrypt certificates over the Cloudflare DNS-01 challenge"
+
+COPY runner/certbot /usr/local/bin/certbot-runner
+RUN chmod +x /usr/local/bin/certbot-runner
+
+# The upstream image sets certbot itself as the entrypoint
+ENTRYPOINT [ "/bin/sh", "/usr/local/bin/certbot-runner" ]
